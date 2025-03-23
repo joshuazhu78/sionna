@@ -41,12 +41,16 @@ class PilotPattern():
         dtype. Defaults to `tf.complex64`.
     """
     def __init__(self, mask, pilots, trainable=False, normalize=False,
-                 dtype=tf.complex64):
+                 dtype=tf.complex64, pilots1=None):
         super().__init__()
         self._dtype = dtype
         self._mask = tf.cast(mask, tf.int32)
         self._pilots = tf.Variable(tf.cast(pilots, self._dtype), trainable)
         self.normalize = normalize
+        if pilots1 is None:
+            self._pilots1 = None
+        else:
+            self._pilots1 = tf.Variable(tf.cast(pilots1, self._dtype), trainable)
         self._check_settings()
 
     @property
@@ -114,6 +118,26 @@ class PilotPattern():
     @pilots.setter
     def pilots(self, value):
         self._pilots.assign(value)
+
+    @property
+    def pilots1(self):
+        """Returns or sets the possibly normalized tensor of pilot symbols.
+           If pilots are normalized, the normalization will be applied
+           after new values for pilots have been set. If this is
+           not the desired behavior, turn normalization off.
+        """
+        def norm_pilots1():
+            scale = tf.abs(self._pilots1)**2
+            scale = 1/tf.sqrt(tf.reduce_mean(scale, axis=-1, keepdims=True))
+            scale = tf.cast(scale, self._dtype)
+            return scale*self._pilots1
+
+        return tf.cond(self.normalize, norm_pilots1, lambda: self._pilots1)
+
+    @pilots1.setter
+    def pilots1(self, value):
+        self._pilots1.assign(value)
+
 
     def _check_settings(self):
         """Validate that all properties define a valid pilot pattern."""
@@ -290,6 +314,10 @@ class KroneckerPilotPattern(PilotPattern):
         Defines the datatype for internal calculations and the output
         dtype. Defaults to `tf.complex64`.
 
+    pilot_blind_detection : Bool
+        Whether to initilize a second pilot sequence for blind detection
+        dtype. Defaults to True.
+
     Note
     ----
     It is required that the ``resource_grid``'s property
@@ -319,7 +347,8 @@ class KroneckerPilotPattern(PilotPattern):
                  pilot_ofdm_symbol_indices,
                  normalize=True,
                  seed=0,
-                 dtype=tf.complex64):
+                 dtype=tf.complex64,
+                 pilot_blind_detection=True):
 
         num_tx = resource_grid.num_tx
         num_streams_per_tx = resource_grid.num_streams_per_tx
@@ -348,12 +377,18 @@ class KroneckerPilotPattern(PilotPattern):
         mask = np.zeros(shape, bool)
         shape[2] = num_pilot_symbols
         pilots = np.zeros(shape, np.complex64)
+        pilots1 = None
+        if pilot_blind_detection:
+            pilots1 = np.zeros(shape, np.complex64)
 
         # Populate all selected OFDM symbols in the mask
         mask[..., pilot_ofdm_symbol_indices, :] = True
 
         # Populate the pilots with random QPSK symbols
         qam_source = QAMSource(2, seed=seed, dtype=self._dtype)
+        if pilot_blind_detection:
+            qam_source1 = QAMSource(2, seed=None, dtype=self._dtype)
+
         for i in range(num_tx):
             for j in range(num_streams_per_tx):
                 # Generate random QPSK symbols
@@ -362,8 +397,18 @@ class KroneckerPilotPattern(PilotPattern):
                 # Place pilots spaced by num_seq to avoid overlap
                 pilots[i,j,:,i*num_streams_per_tx+j::num_seq] = p
 
+                if pilot_blind_detection:
+                    # Generate random QPSK symbols
+                    p1 = qam_source1([1,1,num_pilot_symbols,num_pilots_per_symbol])
+
+                    # Place pilots spaced by num_seq to avoid overlap
+                    pilots1[i,j,:,i*num_streams_per_tx+j::num_seq] = p1
+
         # Reshape the pilots tensor
         pilots = np.reshape(pilots, [num_tx, num_streams_per_tx, -1])
 
+        if pilot_blind_detection:
+            pilots1 = np.reshape(pilots1, [num_tx, num_streams_per_tx, -1])
+
         super().__init__(mask, pilots, trainable=False,
-                         normalize=normalize, dtype=self._dtype)
+                         normalize=normalize, dtype=self._dtype, pilots1=pilots1)
