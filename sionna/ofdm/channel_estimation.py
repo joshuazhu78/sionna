@@ -169,14 +169,14 @@ class BaseChannelEstimator(ABC, Layer):
         # We do a save division to replace Inf by 0.
         # Broadcasting from pilots here is automatic since pilots have shape
         # [num_tx, num_streams, num_pilot_symbols]
-        h_hat, err_var = self.estimate_at_pilot_locations(y_pilots, no)
+        h_hat, err_var, num_wrong_seqs = self.estimate_at_pilot_locations(y_pilots, no)
 
         # Interpolate channel estimates over the resource grid
         if self._interpolation_type is not None:
             h_hat, err_var = self._interpol(h_hat, err_var)
             err_var = tf.maximum(err_var, tf.cast(0, err_var.dtype))
 
-        return h_hat, err_var
+        return h_hat, err_var, num_wrong_seqs
 
 
 class LSChannelEstimator(BaseChannelEstimator, Layer):
@@ -285,6 +285,52 @@ class LSChannelEstimator(BaseChannelEstimator, Layer):
         # [num_tx, num_streams, num_pilot_symbols]
         h_ls = tf.math.divide_no_nan(y_pilots, self._pilot_pattern.pilots)
 
+        # Blind detection of pilot sequence
+        h_ls1 = tf.math.divide_no_nan(y_pilots, self._pilot_pattern.pilots1)
+
+        new_shape = h_ls.shape
+
+        # reshape to last dimension as OFDM symbol
+        pilot_syms_loc = tf.where(tf.equal(self._pilot_pattern.mask, 1))
+        pilot_syms_loc = pilot_syms_loc.numpy()
+        pilot_syms_loc = pilot_syms_loc[:,2]
+        pilot_syms_loc = np.unique(pilot_syms_loc)
+        num_pilots_syms = len(pilot_syms_loc)
+        num_pilots_per_sym = h_ls.shape[-1] // num_pilots_syms
+        new_shape = np.append(new_shape, num_pilots_per_sym)
+        new_shape[-2] = new_shape[-2] / num_pilots_per_sym
+        h_ls_ = tf.reshape(h_ls, new_shape)
+        h_ls1_ = tf.reshape(h_ls1, new_shape)
+
+        # diff correlation
+        h_ls_1 = h_ls_[:,:,:,:,:,:,0:num_pilots_per_sym-1]
+        h_ls_2 = tf.math.conj(h_ls_[:,:,:,:,:,:,1:num_pilots_per_sym])
+        h_ls_p = tf.math.multiply(h_ls_1, h_ls_2)
+
+        h_ls_mean = tf.reduce_mean(h_ls_p, -1)
+        h_ls_mean = tf.math.abs(h_ls_mean)
+        h_ls_mean = tf.reduce_mean(h_ls_mean, -1)
+        #h_ls_mean = expand_tensor_last_dim(h_ls_mean, h_ls.shape[-1])
+
+        h_ls1_1 = h_ls1_[:,:,:,:,:,:,0:num_pilots_per_sym-1]
+        h_ls1_2 = tf.math.conj(h_ls1_[:,:,:,:,:,:,1:num_pilots_per_sym])
+        h_ls1_p = tf.math.multiply(h_ls1_1, h_ls1_2)
+
+        h_ls1_mean = tf.reduce_mean(h_ls1_p, -1)
+        h_ls1_mean = tf.math.abs(h_ls1_mean)
+        h_ls1_mean = tf.reduce_mean(h_ls1_mean, -1)
+        #h_ls1_mean = expand_tensor_last_dim(h_ls1_mean, h_ls1.shape[-1])
+
+        h_subs = tf.math.subtract(h_ls_mean, h_ls1_mean)
+        wrong_sequence = tf.where(tf.less(h_subs, 0))
+        if len(wrong_sequence.shape)==0:
+            num_of_seq_errors = 0
+        else:
+            num_of_seq_errors = wrong_sequence.shape[0]
+
+        # unmark below line to see impact of blind detection error on channel estimation
+        #h_ls = tf.tensor_scatter_nd_update(h_ls, wrong_sequence, tf.gather_nd(h_ls1, wrong_sequence))
+
         # Compute error variance and broadcast to the same shape as h_ls
         # Expand rank of no for broadcasting
         no = expand_to_rank(no, tf.rank(h_ls), -1)
@@ -295,7 +341,7 @@ class LSChannelEstimator(BaseChannelEstimator, Layer):
         # Compute error variance, broadcastable to the shape of h_ls
         err_var = tf.math.divide_no_nan(no, tf.abs(pilots)**2)
 
-        return h_ls, err_var
+        return h_ls, err_var, num_of_seq_errors
 
 
 class BaseChannelInterpolator(ABC):
